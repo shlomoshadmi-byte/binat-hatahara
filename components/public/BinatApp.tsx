@@ -1,0 +1,732 @@
+"use client";
+
+import { useEffect, useMemo, useState } from "react";
+import {
+  CalendarDays,
+  CheckCircle2,
+  Clock3,
+  Edit3,
+  Moon,
+  Plus,
+  Settings,
+  ShieldCheck,
+  Sun,
+  Trash2,
+} from "lucide-react";
+import { addMonths, eachDayOfInterval, endOfMonth, endOfWeek, format, startOfMonth, startOfWeek, subMonths } from "date-fns";
+import type { ActiveConfigResult } from "@/lib/config/repository";
+import type { AppConfig, CalculationPreset, Language, Onah } from "@/lib/config/schema";
+import { direction, text } from "@/lib/i18n";
+import {
+  assertDateOnly,
+  dateOnlyToLocalDate,
+  formatDateOnly,
+  formatHebrewDate,
+  localDateToDateOnly,
+  todayDateOnly,
+  type DateOnly,
+} from "@/lib/dates";
+import { calculateVesatot, type PeriodEntry, vesetTypeLabel } from "@/lib/veset";
+
+type Tab = "upcoming" | "calendar" | "entries" | "settings";
+type CalendarMode = "gregorian" | "hebrew";
+
+interface UserPreferences {
+  language: Language;
+  activePresetId: string;
+  calendarMode: CalendarMode;
+}
+
+interface EntryForm {
+  id: string | null;
+  date: DateOnly;
+  onah: Onah;
+}
+
+const ENTRY_STORAGE_KEY = "period_entries";
+const PREFERENCES_STORAGE_KEY = "user_preferences";
+const CONFIG_VERSION_STORAGE_KEY = "active_config_version";
+
+export function BinatApp({ initialConfig }: { initialConfig: ActiveConfigResult }) {
+  const [configInfo, setConfigInfo] = useState(initialConfig);
+  const [entries, setEntries] = useState<PeriodEntry[]>([]);
+  const [activeTab, setActiveTab] = useState<Tab>("upcoming");
+  const [form, setForm] = useState<EntryForm | null>(null);
+  const [preferences, setPreferences] = useState<UserPreferences>(() =>
+    defaultPreferences(initialConfig.config),
+  );
+
+  const config = configInfo.config;
+  const language = preferences.language;
+  const isRtl = direction(language) === "rtl";
+
+  const activePreset = useMemo(() => {
+    if (!config.featureFlags.allowManualPresetSelection) {
+      return requirePreset(config, config.activePresetId);
+    }
+
+    return requirePreset(config, preferences.activePresetId);
+  }, [config, preferences.activePresetId]);
+
+  const calculated = useMemo(
+    () => calculateVesatot(entries, activePreset, language),
+    [entries, activePreset, language],
+  );
+
+  useEffect(() => {
+    queueMicrotask(() => {
+      const savedEntries = safeReadJson<PeriodEntry[]>(ENTRY_STORAGE_KEY, []);
+      setEntries(
+        savedEntries
+          .map((entry) => {
+            try {
+              return { ...entry, date: assertDateOnly(entry.date) };
+            } catch {
+              return null;
+            }
+          })
+          .filter((entry): entry is PeriodEntry => Boolean(entry)),
+      );
+
+      const savedPreferences = safeReadJson<UserPreferences | null>(PREFERENCES_STORAGE_KEY, null);
+      if (savedPreferences) {
+        setPreferences(normalizePreferences(config, savedPreferences));
+      }
+    });
+  }, [config]);
+
+  useEffect(() => {
+    window.localStorage.setItem(ENTRY_STORAGE_KEY, JSON.stringify(entries));
+  }, [entries]);
+
+  useEffect(() => {
+    window.localStorage.setItem(PREFERENCES_STORAGE_KEY, JSON.stringify(preferences));
+  }, [preferences]);
+
+  useEffect(() => {
+    window.localStorage.setItem(CONFIG_VERSION_STORAGE_KEY, String(configInfo.version));
+  }, [configInfo.version]);
+
+  useEffect(() => {
+    let isMounted = true;
+    fetch("/api/config/active", { cache: "no-store" })
+      .then((response) => (response.ok ? response.json() : null))
+      .then((payload: ActiveConfigResult | null) => {
+        if (payload && isMounted && payload.version !== configInfo.version) {
+          setConfigInfo(payload);
+          setPreferences((current) => normalizePreferences(payload.config, current));
+        }
+      })
+      .catch(() => undefined);
+
+    return () => {
+      isMounted = false;
+    };
+  }, [configInfo.version]);
+
+  function openAdd(date = todayDateOnly()) {
+    setForm({ id: null, date, onah: "day" });
+  }
+
+  function openEdit(entry: PeriodEntry) {
+    setForm({ id: entry.id, date: entry.date, onah: entry.onah });
+  }
+
+  function saveEntry() {
+    if (!form) {
+      return;
+    }
+
+    const normalized: PeriodEntry = {
+      id: form.id || crypto.randomUUID(),
+      date: assertDateOnly(form.date),
+      onah: form.onah,
+    };
+
+    setEntries((current) => {
+      if (form.id) {
+        return current.map((entry) => (entry.id === form.id ? normalized : entry));
+      }
+
+      return [...current, normalized].sort((a, b) => a.date.localeCompare(b.date));
+    });
+    setForm(null);
+  }
+
+  function deleteEntry(id: string) {
+    setEntries((current) => current.filter((entry) => entry.id !== id));
+  }
+
+  return (
+    <main dir={isRtl ? "rtl" : "ltr"} className="min-h-screen px-4 py-6 text-ink sm:px-6">
+      <div className="mx-auto flex w-full max-w-6xl flex-col gap-5">
+        <header className="flex flex-col gap-4 rounded-[2rem] border border-white bg-white/85 p-5 shadow-soft backdrop-blur md:flex-row md:items-center md:justify-between">
+          <div>
+            <p className="mb-2 inline-flex items-center gap-2 rounded-full bg-cedar/10 px-3 py-1 text-xs font-semibold text-cedar">
+              <ShieldCheck size={14} />
+              {text(config.appText.privacyNote, language)}
+            </p>
+            <h1 className="text-3xl font-bold tracking-tight">{text(config.appText.appTitle, language)}</h1>
+            <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-600">
+              {text(config.appText.guidanceNotice, language)}
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            {config.enabledLanguages.map((lang) => (
+              <button
+                key={lang}
+                type="button"
+                onClick={() => setPreferences((current) => ({ ...current, language: lang }))}
+                className={`focus-ring rounded-full px-4 py-2 text-sm font-semibold transition ${
+                  language === lang ? "bg-ink text-white" : "bg-slate-100 text-slate-700 hover:bg-slate-200"
+                }`}
+              >
+                {lang === "he" ? "עברית" : "English"}
+              </button>
+            ))}
+            <a
+              href="/admin"
+              className={`focus-ring rounded-full px-4 py-2 text-sm font-semibold transition ${
+                config.featureFlags.showAdminLink
+                  ? "bg-berry text-white hover:bg-berry/90"
+                  : "hidden"
+              }`}
+            >
+              Admin
+            </a>
+          </div>
+        </header>
+
+        <section className="grid gap-5 lg:grid-cols-[18rem_1fr]">
+          <aside className="flex flex-col gap-3">
+            <ConfigStatus configInfo={configInfo} activePreset={activePreset} language={language} />
+            <nav className="grid grid-cols-2 gap-2 lg:grid-cols-1">
+              <TabButton
+                active={activeTab === "upcoming"}
+                icon={Clock3}
+                label={text(config.appText.upcomingOnot, language)}
+                onClick={() => setActiveTab("upcoming")}
+              />
+              <TabButton
+                active={activeTab === "calendar"}
+                icon={CalendarDays}
+                label={text(config.appText.calendar, language)}
+                onClick={() => setActiveTab("calendar")}
+              />
+              <TabButton
+                active={activeTab === "entries"}
+                icon={Edit3}
+                label={text(config.appText.entries, language)}
+                onClick={() => setActiveTab("entries")}
+              />
+              <TabButton
+                active={activeTab === "settings"}
+                icon={Settings}
+                label={text(config.appText.settings, language)}
+                onClick={() => setActiveTab("settings")}
+              />
+            </nav>
+            <button
+              type="button"
+              onClick={() => openAdd()}
+              className="focus-ring inline-flex items-center justify-center gap-2 rounded-2xl bg-cedar px-4 py-3 font-semibold text-white shadow-soft transition hover:bg-cedar/90"
+            >
+              <Plus size={18} />
+              {text(config.appText.addEntry, language)}
+            </button>
+          </aside>
+
+          <section className="min-h-[34rem] rounded-[2rem] border border-white bg-white/90 p-4 shadow-soft sm:p-6">
+            {activeTab === "upcoming" && (
+              <UpcomingPanel
+                config={config}
+                entries={entries}
+                language={language}
+                calculated={calculated}
+              />
+            )}
+            {activeTab === "calendar" && (
+              <CalendarPanel
+                entries={entries}
+                language={language}
+                calculated={calculated}
+                mode={preferences.calendarMode}
+                onModeChange={(mode) => setPreferences((current) => ({ ...current, calendarMode: mode }))}
+                onDateClick={openAdd}
+              />
+            )}
+            {activeTab === "entries" && (
+              <EntriesPanel
+                config={config}
+                entries={entries}
+                language={language}
+                onEdit={openEdit}
+                onDelete={deleteEntry}
+              />
+            )}
+            {activeTab === "settings" && (
+              <SettingsPanel
+                config={config}
+                language={language}
+                preferences={preferences}
+                onPreferencesChange={setPreferences}
+              />
+            )}
+          </section>
+        </section>
+      </div>
+
+      {form && (
+        <EntryModal
+          config={config}
+          language={language}
+          form={form}
+          onChange={setForm}
+          onClose={() => setForm(null)}
+          onSave={saveEntry}
+        />
+      )}
+    </main>
+  );
+}
+
+function UpcomingPanel({
+  config,
+  entries,
+  language,
+  calculated,
+}: {
+  config: AppConfig;
+  entries: PeriodEntry[];
+  language: Language;
+  calculated: ReturnType<typeof calculateVesatot>;
+}) {
+  return (
+    <div className="space-y-5">
+      <div className="flex items-center justify-between gap-3">
+        <h2 className="text-2xl font-bold">{text(config.appText.upcomingOnot, language)}</h2>
+        <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-600">
+          {entries.length} {text(config.appText.entries, language)}
+        </span>
+      </div>
+
+      {calculated.length === 0 ? (
+        <EmptyState message={text(config.appText.noEntries, language)} />
+      ) : (
+        <div className="grid gap-3">
+          {calculated.map((veset) => (
+            <div
+              key={veset.id}
+              className="rounded-2xl border border-slate-100 bg-white p-4 shadow-sm"
+            >
+              <div className="flex items-start gap-4">
+                <div
+                  className={`flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl ${
+                    veset.onah === "day" ? "bg-amber-100 text-amber-600" : "bg-slate-900 text-white"
+                  }`}
+                >
+                  {veset.onah === "day" ? <Sun size={22} /> : <Moon size={22} />}
+                </div>
+                <div className="min-w-0 flex-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <h3 className="font-bold">{vesetTypeLabel(veset.type, language)}</h3>
+                    <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs font-semibold text-slate-600">
+                      {veset.onah === "day"
+                        ? text(config.appText.day, language)
+                        : text(config.appText.night, language)}
+                    </span>
+                  </div>
+                  <p className="mt-1 text-sm font-semibold text-slate-700">
+                    {formatDateOnly(veset.date, "EEEE, MMM d, yyyy")}
+                  </p>
+                  <p className="text-sm text-berry">{veset.hebrewDate}</p>
+                  <p className="mt-2 text-sm leading-6 text-slate-500">{veset.description}</p>
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CalendarPanel({
+  entries,
+  calculated,
+  language,
+  mode,
+  onModeChange,
+  onDateClick,
+}: {
+  entries: PeriodEntry[];
+  calculated: ReturnType<typeof calculateVesatot>;
+  language: Language;
+  mode: CalendarMode;
+  onModeChange: (mode: CalendarMode) => void;
+  onDateClick: (date: DateOnly) => void;
+}) {
+  const [currentDate, setCurrentDate] = useState(() => new Date());
+  const monthStart = startOfMonth(currentDate);
+  const days = eachDayOfInterval({
+    start: startOfWeek(monthStart),
+    end: endOfWeek(endOfMonth(monthStart)),
+  });
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h2 className="text-2xl font-bold">{format(currentDate, "MMMM yyyy")}</h2>
+          <p className="text-sm text-slate-500">{formatHebrewDate(localDateToDateOnly(monthStart), language)}</p>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => onModeChange("gregorian")}
+            className={`focus-ring rounded-full px-3 py-2 text-xs font-bold ${
+              mode === "gregorian" ? "bg-ink text-white" : "bg-slate-100 text-slate-600"
+            }`}
+          >
+            Gregorian
+          </button>
+          <button
+            type="button"
+            onClick={() => onModeChange("hebrew")}
+            className={`focus-ring rounded-full px-3 py-2 text-xs font-bold ${
+              mode === "hebrew" ? "bg-ink text-white" : "bg-slate-100 text-slate-600"
+            }`}
+          >
+            Hebrew
+          </button>
+          <button
+            type="button"
+            onClick={() => setCurrentDate((date) => subMonths(date, 1))}
+            className="focus-ring rounded-full bg-white px-3 py-2 text-sm font-bold text-slate-600 shadow-sm"
+          >
+            Prev
+          </button>
+          <button
+            type="button"
+            onClick={() => setCurrentDate((date) => addMonths(date, 1))}
+            className="focus-ring rounded-full bg-white px-3 py-2 text-sm font-bold text-slate-600 shadow-sm"
+          >
+            Next
+          </button>
+        </div>
+      </div>
+      <div className="grid grid-cols-7 overflow-hidden rounded-2xl border border-slate-100 bg-white">
+        {["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map((day) => (
+          <div key={day} className="bg-slate-50 p-2 text-center text-xs font-bold text-slate-400">
+            {day}
+          </div>
+        ))}
+        {days.map((day) => {
+          const dateOnly = localDateToDateOnly(day);
+          const dayEntries = entries.filter((entry) => entry.date === dateOnly);
+          const dayVesatot = calculated.filter((veset) => veset.date === dateOnly);
+          const inMonth = day.getMonth() === currentDate.getMonth();
+          return (
+            <button
+              key={dateOnly}
+              type="button"
+              onClick={() => onDateClick(dateOnly)}
+              className={`focus-ring min-h-28 border-t border-slate-100 p-2 text-left transition hover:bg-cedar/5 ${
+                inMonth ? "bg-white" : "bg-slate-50/70 text-slate-400"
+              }`}
+            >
+              <span className="block text-sm font-bold">{mode === "hebrew" ? formatHebrewDate(dateOnly, language).split(" ")[0] : format(day, "d")}</span>
+              <span className="block text-[11px] font-semibold text-berry">
+                {mode === "hebrew" ? format(day, "MMM d") : formatHebrewDate(dateOnly, language).split(" ")[0]}
+              </span>
+              <div className="mt-2 space-y-1">
+                {dayEntries.map((entry) => (
+                  <span key={entry.id} className="block truncate rounded bg-cedar/10 px-1.5 py-0.5 text-[11px] font-bold text-cedar">
+                    Entry · {entry.onah}
+                  </span>
+                ))}
+                {dayVesatot.map((veset) => (
+                  <span key={veset.id} className="block truncate rounded bg-berry/10 px-1.5 py-0.5 text-[11px] font-bold text-berry">
+                    {vesetTypeLabel(veset.type, language)}
+                  </span>
+                ))}
+              </div>
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function EntriesPanel({
+  config,
+  entries,
+  language,
+  onEdit,
+  onDelete,
+}: {
+  config: AppConfig;
+  entries: PeriodEntry[];
+  language: Language;
+  onEdit: (entry: PeriodEntry) => void;
+  onDelete: (id: string) => void;
+}) {
+  const sorted = [...entries].sort((a, b) => b.date.localeCompare(a.date));
+  return (
+    <div className="space-y-4">
+      <h2 className="text-2xl font-bold">{text(config.appText.entries, language)}</h2>
+      {sorted.length === 0 ? (
+        <EmptyState message={text(config.appText.noEntries, language)} />
+      ) : (
+        <div className="grid gap-3">
+          {sorted.map((entry) => (
+            <div key={entry.id} className="flex items-center justify-between gap-3 rounded-2xl border border-slate-100 bg-white p-4">
+              <div>
+                <p className="font-bold">{formatDateOnly(entry.date, "EEEE, MMM d, yyyy")}</p>
+                <p className="text-sm text-slate-500">
+                  {formatHebrewDate(entry.date, language)} ·{" "}
+                  {entry.onah === "day" ? text(config.appText.day, language) : text(config.appText.night, language)}
+                </p>
+              </div>
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => onEdit(entry)}
+                  className="focus-ring rounded-full bg-slate-100 p-2 text-slate-600 transition hover:bg-slate-200"
+                  aria-label={text(config.appText.editEntry, language)}
+                >
+                  <Edit3 size={16} />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onDelete(entry.id)}
+                  className="focus-ring rounded-full bg-berry/10 p-2 text-berry transition hover:bg-berry/20"
+                  aria-label={text(config.appText.delete, language)}
+                >
+                  <Trash2 size={16} />
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SettingsPanel({
+  config,
+  language,
+  preferences,
+  onPreferencesChange,
+}: {
+  config: AppConfig;
+  language: Language;
+  preferences: UserPreferences;
+  onPreferencesChange: (preferences: UserPreferences) => void;
+}) {
+  return (
+    <div className="space-y-5">
+      <h2 className="text-2xl font-bold">{text(config.appText.settings, language)}</h2>
+      {config.featureFlags.allowManualPresetSelection && (
+        <label className="block">
+          <span className="mb-2 block text-sm font-bold text-slate-600">
+            {text(config.appText.activePreset, language)}
+          </span>
+          <select
+            value={preferences.activePresetId}
+            onChange={(event) =>
+              onPreferencesChange({ ...preferences, activePresetId: event.target.value })
+            }
+            className="focus-ring w-full rounded-2xl border border-slate-200 bg-white px-4 py-3"
+          >
+            {config.presets.map((preset) => (
+              <option key={preset.id} value={preset.id}>
+                {text(preset.name, language)}
+              </option>
+            ))}
+          </select>
+        </label>
+      )}
+
+      <div className="grid gap-3 md:grid-cols-2">
+        {config.instructions.map((instruction) => (
+          <div key={instruction.id} className="rounded-2xl border border-slate-100 bg-white p-4">
+            <h3 className="font-bold text-cedar">{text(instruction.title, language)}</h3>
+            <p className="mt-2 text-sm leading-6 text-slate-600">{text(instruction.body, language)}</p>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function EntryModal({
+  config,
+  language,
+  form,
+  onChange,
+  onClose,
+  onSave,
+}: {
+  config: AppConfig;
+  language: Language;
+  form: EntryForm;
+  onChange: (form: EntryForm) => void;
+  onClose: () => void;
+  onSave: () => void;
+}) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-ink/35 p-4 backdrop-blur">
+      <div className="w-full max-w-md rounded-[2rem] bg-white p-5 shadow-soft">
+        <h2 className="text-2xl font-bold">
+          {form.id ? text(config.appText.editEntry, language) : text(config.appText.addEntry, language)}
+        </h2>
+        <div className="mt-5 space-y-4">
+          <label className="block">
+            <span className="mb-2 block text-sm font-bold text-slate-600">
+              {text(config.appText.date, language)}
+            </span>
+            <input
+              type="date"
+              value={form.date}
+              onChange={(event) => onChange({ ...form, date: assertDateOnly(event.target.value) })}
+              className="focus-ring w-full rounded-2xl border border-slate-200 px-4 py-3"
+            />
+          </label>
+          <fieldset>
+            <legend className="mb-2 text-sm font-bold text-slate-600">
+              {text(config.appText.onah, language)}
+            </legend>
+            <div className="grid grid-cols-2 gap-2 rounded-2xl bg-slate-100 p-1">
+              {(["day", "night"] as Onah[]).map((onah) => (
+                <button
+                  key={onah}
+                  type="button"
+                  onClick={() => onChange({ ...form, onah })}
+                  className={`focus-ring flex items-center justify-center gap-2 rounded-xl px-4 py-3 font-bold ${
+                    form.onah === onah ? "bg-white text-ink shadow-sm" : "text-slate-500"
+                  }`}
+                >
+                  {onah === "day" ? <Sun size={18} /> : <Moon size={18} />}
+                  {onah === "day" ? text(config.appText.day, language) : text(config.appText.night, language)}
+                </button>
+              ))}
+            </div>
+          </fieldset>
+        </div>
+        <div className="mt-6 flex gap-2">
+          <button
+            type="button"
+            onClick={onClose}
+            className="focus-ring flex-1 rounded-2xl bg-slate-100 px-4 py-3 font-bold text-slate-700"
+          >
+            {text(config.appText.cancel, language)}
+          </button>
+          <button
+            type="button"
+            onClick={onSave}
+            className="focus-ring flex-1 rounded-2xl bg-cedar px-4 py-3 font-bold text-white"
+          >
+            {text(config.appText.save, language)}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ConfigStatus({
+  configInfo,
+  activePreset,
+  language,
+}: {
+  configInfo: ActiveConfigResult;
+  activePreset: CalculationPreset;
+  language: Language;
+}) {
+  return (
+    <div className="rounded-[1.5rem] border border-white bg-white/85 p-4 shadow-soft">
+      <p className="flex items-center gap-2 text-xs font-bold uppercase tracking-wide text-cedar">
+        <CheckCircle2 size={14} />
+        Config v{configInfo.version}
+      </p>
+      <h2 className="mt-2 font-bold">{text(activePreset.name, language)}</h2>
+      <p className="mt-1 text-sm leading-5 text-slate-500">{text(activePreset.description, language)}</p>
+      <p className="mt-3 text-xs font-semibold text-slate-400">
+        Source: {configInfo.source}
+      </p>
+    </div>
+  );
+}
+
+function TabButton({
+  active,
+  icon: Icon,
+  label,
+  onClick,
+}: {
+  active: boolean;
+  icon: typeof Clock3;
+  label: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`focus-ring flex items-center gap-3 rounded-2xl px-4 py-3 text-left font-semibold transition ${
+        active ? "bg-ink text-white shadow-soft" : "bg-white/85 text-slate-600 hover:bg-white"
+      }`}
+    >
+      <Icon size={18} />
+      <span className="truncate">{label}</span>
+    </button>
+  );
+}
+
+function EmptyState({ message }: { message: string }) {
+  return (
+    <div className="flex min-h-64 flex-col items-center justify-center rounded-[2rem] border border-dashed border-slate-200 bg-slate-50 p-8 text-center">
+      <CalendarDays className="text-slate-300" size={44} />
+      <p className="mt-4 max-w-md text-sm leading-6 text-slate-500">{message}</p>
+    </div>
+  );
+}
+
+function defaultPreferences(config: AppConfig): UserPreferences {
+  return {
+    language: config.defaultLanguage,
+    activePresetId: config.activePresetId,
+    calendarMode: "gregorian",
+  };
+}
+
+function normalizePreferences(config: AppConfig, preferences: UserPreferences): UserPreferences {
+  const language = config.enabledLanguages.includes(preferences.language)
+    ? preferences.language
+    : config.defaultLanguage;
+  const activePresetId = config.presets.some((preset) => preset.id === preferences.activePresetId)
+    ? preferences.activePresetId
+    : config.activePresetId;
+
+  return {
+    language,
+    activePresetId,
+    calendarMode: preferences.calendarMode === "hebrew" ? "hebrew" : "gregorian",
+  };
+}
+
+function requirePreset(config: AppConfig, id: string): CalculationPreset {
+  return config.presets.find((preset) => preset.id === id) || config.presets[0];
+}
+
+function safeReadJson<T>(key: string, fallback: T): T {
+  try {
+    const value = window.localStorage.getItem(key);
+    return value ? (JSON.parse(value) as T) : fallback;
+  } catch {
+    return fallback;
+  }
+}
